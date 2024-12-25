@@ -702,6 +702,7 @@ class MaskHelper:
         bboxs = ["bbox/"+x for x in folder_paths.get_filename_list("ultralytics_bbox")]
         segms = ["segm/"+x for x in folder_paths.get_filename_list("ultralytics_segm")]
         sam_models = [x for x in folder_paths.get_filename_list("sams") if 'hq' not in x]
+        sam_model_configs = [x for x in folder_paths.get_filename_list("configs")]
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -712,6 +713,7 @@ class MaskHelper:
                 "bbox_crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 100, "step": 0.1}),
                 "bbox_drop_size": ("INT", {"min": 1, "max": 8192, "step": 1, "default": 10}),
                 "sam_model_name": (sam_models, ),
+                "sam_model_config": (sam_model_configs, ),
                 "sam_dilation": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1}),
                 "sam_threshold": ("FLOAT", {"default": 0.93, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "bbox_expansion": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
@@ -732,15 +734,28 @@ class MaskHelper:
     FUNCTION = "execute"
     CATEGORY = "🌌 ReActor"
 
-    def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None):
+    def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_model_config, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None):
 
+        elapsedTime  = datetime.utcnow()
         elapsedUTC  = datetime.utcnow()
+
+        def printElapsed(elapseName: str = ""):
+            nonlocal elapsedUTC
+            elapsedUTC = datetime.utcnow() - elapsedUTC
+            hours, remainder = divmod(elapsedUTC.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            microseconds = elapsedUTC.microseconds // 1000
+            print(f"{elapseName} Elapsed - {int(seconds):02}.{microseconds:03}")
+            elapsedUTC = datetime.utcnow()
 
         device = model_management.get_torch_device()
     
         image = image.to(device, non_blocking=True)
         swapped_image = swapped_image.to(device, non_blocking=True)
         
+
+        printElapsed('Setup')
+
         def tensor2rgba_on_device(tensor, device):
             if len(tensor.shape) == 3:
                 tensor = tensor.unsqueeze(0)
@@ -764,6 +779,8 @@ class MaskHelper:
                 # Detect faces
                 segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, self.detailer_hook)
 
+                printElapsed('Face Detect')              
+
                 if isinstance(self.labels, list):
                     self.labels = str(self.labels[0])
                 if self.labels is not None and self.labels != '':
@@ -774,8 +791,22 @@ class MaskHelper:
                 # Load and cache SAM model
                 if not hasattr(self, '_cached_sam_model') or self._cached_sam_model_path != sam_model_name:
                     sam_modelname = folder_paths.get_full_path("sams", sam_model_name)
-                    model_kind = 'vit_h' if 'vit_h' in sam_model_name else 'vit_l' if 'vit_l' in sam_model_name else 'vit_b'
-                    sam = sam_model_registry[model_kind](checkpoint=sam_modelname)
+                    
+                    # Check if it's a SAM 2.1 model
+                    is_sam2 = any(variant in sam_model_name.lower() for variant in ['hiera_tiny', 'hiera_small', 'hiera_base_plus', 'hiera_large'])
+                    
+                    if is_sam2:
+                        # SAM 2.1 loading
+                        from sam2.build_sam import build_sam2
+                        
+                        sam_model_config_path = folder_paths.get_full_path("configs", sam_model_config)
+
+                        sam = build_sam2(sam_model_config_path, sam_modelname)
+                    else:
+                        # Original SAM loading
+                        model_kind = 'vit_h' if 'vit_h' in sam_model_name else 'vit_l' if 'vit_l' in sam_model_name else 'vit_b'
+                        sam = sam_model_registry[model_kind](checkpoint=sam_modelname)
+                    
                     size = os.path.getsize(sam_modelname)
                     sam.safe_to = core.SafeToGPU(size)
                     sam.safe_to.to_device(sam, device)
@@ -787,10 +818,14 @@ class MaskHelper:
                 combined_mask, _ = core.make_sam_mask_segmented(self._cached_sam_model, segs, image, self.detection_hint, 
                                                               sam_dilation, sam_threshold, bbox_expansion, 
                                                               mask_hint_threshold, mask_hint_use_negative)              
+                printElapsed('Generate mask')
 
             # Process mask
             mask_image = combined_mask.reshape((-1, 1, combined_mask.shape[-2], combined_mask.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3)
             mask_image = core.tensor2mask(mask_image).to(device)
+
+            printElapsed('Process mask')
+
 
             if morphology_distance > 0:
                 kernel = torch.ones((morphology_distance * 2 + 1, morphology_distance * 2 + 1), device=device)
@@ -821,10 +856,14 @@ class MaskHelper:
             if mask_image_final.size()[3] == 1:
                 mask_image_final = mask_image_final[:, :, :, 0]
 
+            printElapsed('Post Process mask')         
+
             # Prepare images and mask
             original_image = tensor2rgba_on_device(image, device)
             swapped_image = tensor2rgba_on_device(swapped_image, device)
             mask = core.tensor2mask(mask_image_final).to(device)
+
+            printElapsed('Prepare image and mask')         
 
             # Match sizes
             B, H, W, _ = swapped_image.shape
@@ -846,10 +885,12 @@ class MaskHelper:
 
             result = rgba2rgb_tensor(result)
 
-            elapsedUTC = datetime.utcnow() - elapsedUTC
-            hours, remainder = divmod(elapsedUTC.total_seconds(), 3600)
+            printElapsed('to rgb')         
+
+            elapsedTime = datetime.utcnow() - elapsedTime
+            hours, remainder = divmod(elapsedTime.total_seconds(), 3600)
             minutes, seconds = divmod(remainder, 60)
-            microseconds = elapsedUTC.microseconds // 1000
+            microseconds = elapsedTime.microseconds // 1000
             print(f"Masking Helper Elapsed - {int(seconds):02}.{microseconds:03}")
 
             return (result, combined_mask, mask_image_final, face_segment)

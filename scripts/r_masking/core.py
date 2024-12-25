@@ -8,6 +8,8 @@ from keyword import iskeyword as _iskeyword
 from operator import itemgetter as _itemgetter
 
 from segment_anything import SamPredictor
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 from comfy import model_management
 from datetime import datetime
@@ -533,14 +535,34 @@ def merge_and_stack_masks(stacked_masks, group_size):
 def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
                             threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative):
 
+    elapsedTime  = datetime.utcnow()
+    elapsedUTC  = datetime.utcnow()
+
+    def printElapsed(elapseName: str = ""):
+        nonlocal elapsedUTC
+        elapsedUTC = datetime.utcnow() - elapsedUTC
+        hours, remainder = divmod(elapsedUTC.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        microseconds = elapsedUTC.microseconds // 1000
+        print(f"{elapseName} Elapsed - {int(seconds):02}.{microseconds:03}")
+        elapsedUTC = datetime.utcnow()
+
     if sam_model.is_auto_mode:
         device = model_management.get_torch_device()
         sam_model.safe_to.to_device(sam_model, device=device)
 
     try:
-        predictor = SamPredictor(sam_model)
+        predictor = SAM2ImagePredictor(sam_model)
         image = np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8) 
+        #with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         predictor.set_image(image, "RGB")
+        #masks, _, _ = predictor.predict(<input_prompts>)
+
+        #predictor = SamPredictor(sam_model)
+        #image = np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8) 
+        #predictor.set_image(image, "RGB")
+
+        printElapsed('Sam Predictor')
 
         total_masks = []
 
@@ -581,16 +603,21 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
                                                          mask_hint_threshold, use_small_negative,
                                                          mask_hint_use_negative)
 
+                #detected_masks = sam_predict(predictor, points, plabs, dilated_bbox, threshold)
                 detected_masks = sam_predict(predictor, points, plabs, dilated_bbox, threshold)
 
                 total_masks += detected_masks
 
+        printElapsed('Dectection')
+
         # merge every collected masks
         mask = combine_masks2(total_masks)
 
+        printElapsed('Combine Mask')
+
     finally:
-        #if sam_model.is_auto_mode:
-        #    sam_model.cpu()
+        if sam_model.is_auto_mode:
+            sam_model.cpu()
 
         pass
 
@@ -609,6 +636,8 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
         )  # empty mask
 
     stacked_masks = convert_and_stack_masks(total_masks)
+
+    printElapsed('Stack Mask')
 
     return (mask, merge_and_stack_masks(stacked_masks, group_size=3))
 
